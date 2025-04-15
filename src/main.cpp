@@ -1,143 +1,200 @@
+#define LED_PIN 48
+#define SDA_PIN GPIO_NUM_11
+#define SCL_PIN GPIO_NUM_12
+
 #include <WiFi.h>
 #include <Arduino_MQTT_Client.h>
 #include <ThingsBoard.h>
 #include "DHT20.h"
 #include "Wire.h"
-#include <HTTPClient.h>
-#include <Update.h>
-#include <math.h>
+#include <ArduinoOTA.h>
 
+constexpr char WIFI_SSID[] = "abcd";
+constexpr char WIFI_PASSWORD[] = "123456789";
 
-#define LED_PIN 2                        
-#define SDA_PIN 21
-#define SCL_PIN 22         
+constexpr char TOKEN[] = "7s5pokn2se622pzn1jxu";
 
-// WiFi credentials
-constexpr char WIFI_SSID[] = "DC";
-constexpr char WIFI_PASSWORD[] = "2444666668888888";
-
-// ThingsBoard credentials
-constexpr char TOKEN[] = "2nm80obclx3l43zw0vc5";
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
-// OTA update URL (replace with real URL later)
-const char* firmwareURL = "https://yourusername.github.io/yourrepo/firmware.bin";
-#define OTA_CHECK_INTERVAL 60000  // 1 minute
+constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
+constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
+
+constexpr char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
+constexpr char LED_MODE_ATTR[] = "ledMode";
+constexpr char LED_STATE_ATTR[] = "ledState";
+
+volatile bool attributesChanged = false;
+volatile int ledMode = 0;
+volatile bool ledState = false;
+
+constexpr uint16_t BLINKING_INTERVAL_MS_MIN = 10U;
+constexpr uint16_t BLINKING_INTERVAL_MS_MAX = 60000U;
+volatile uint16_t blinkingInterval = 1000U;
+
+uint32_t previousStateChange;
+
+constexpr int16_t telemetrySendInterval = 10000U;
+uint32_t previousDataSend;
+
+constexpr std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
+  LED_STATE_ATTR,
+  BLINKING_INTERVAL_ATTR
+};
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
-ThingsBoard tb(mqttClient);
+ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
+
 DHT20 dht20;
 
-void otaUpdateTask(void *pvParameters) {
-  while (true) {
-    Serial.println("Checking for OTA update...");
-    WiFiClient client;
-    HTTPClient http;
-
-    http.begin(client, firmwareURL);
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-      int contentLength = http.getSize();
-      if (contentLength <= 0) {
-        Serial.println("Invalid content length");
-        http.end();
-        vTaskDelay(OTA_CHECK_INTERVAL / portTICK_PERIOD_MS);
-        continue;
-      }
-
-      bool canBegin = Update.begin(contentLength);
-      if (canBegin) {
-        Serial.println("Starting OTA update...");
-        size_t written = Update.writeStream(http.getStream());
-
-        if (written == contentLength) {
-          Serial.println("OTA written successfully. Rebooting...");
-          if (Update.end() && Update.isFinished()) {
-            ESP.restart();
-          } else {
-            Serial.printf("OTA failed: %s\n", Update.errorString());
-          }
-        } else {
-          Serial.println("Written size mismatch.");
-        }
-      } else {
-        Serial.println("Not enough space for OTA update.");
-      }
-    } else {
-      Serial.printf("HTTP Error: %d\n", httpCode);
-    }
-
-    http.end();
-    vTaskDelay(OTA_CHECK_INTERVAL / portTICK_PERIOD_MS);
-  }
+RPC_Response setLedSwitchState(const RPC_Data &data) {
+    Serial.println("Received Switch state");
+    bool newState = data;
+    Serial.print("Switch state change: ");
+    Serial.println(newState);
+    digitalWrite(LED_PIN, newState);
+    attributesChanged = true;
+    return RPC_Response("setLedSwitchValue", newState);
 }
 
-void checkWiFiTask(void *pvParameters) {
-  while (true) {
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected. Reconnecting...");
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      while (WiFi.status() != WL_CONNECTED) {
-        Serial.print(".");
-        delay(500);
+const std::array<RPC_Callback, 1U> callbacks = {
+  RPC_Callback{ "setLedSwitchValue", setLedSwitchState }
+};
+
+void processSharedAttributes(const Shared_Attribute_Data &data) {
+  for (auto it = data.begin(); it != data.end(); ++it) {
+    if (strcmp(it->key().c_str(), BLINKING_INTERVAL_ATTR) == 0) {
+      const uint16_t new_interval = it->value().as<uint16_t>();
+      if (new_interval >= BLINKING_INTERVAL_MS_MIN && new_interval <= BLINKING_INTERVAL_MS_MAX) {
+        blinkingInterval = new_interval;
+        Serial.print("Blinking interval is set to: ");
+        Serial.println(new_interval);
       }
-      Serial.println("Reconnected to WiFi");
+    } else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
+      ledState = it->value().as<bool>();
+      digitalWrite(LED_PIN, ledState);
+      Serial.print("LED state is set to: ");
+      Serial.println(ledState);
     }
-    vTaskDelay(10000 / portTICK_PERIOD_MS);
   }
+  attributesChanged = true;
 }
 
-void checkCoreIoTTask(void *pvParameters) {
-  while (true) {
-    if (!tb.connected()) {
-      Serial.println("Connecting to ThingsBoard...");
-      if (tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-        Serial.println("Connected to ThingsBoard");
-      } else {
-        Serial.println("Failed to connect to ThingsBoard");
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-        continue;
-      }
-    }
-    tb.loop();
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+const Shared_Attribute_Callback attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
+const Attribute_Request_Callback attribute_shared_request_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
+
+void InitWiFi() {
+  Serial.println("Connecting to AP ...");
+  // Attempting to establish a connection to the given WiFi network
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    // Delay 500ms until a connection has been successfully established
+    delay(500);
+    Serial.print(".");
   }
+  Serial.println("Connected to AP");
 }
 
-void telemetryTask(void *pvParameters) {
-  while (true) {
-    dht20.read();
-    float temperature = dht20.getTemperature();
-    float humidity = dht20.getHumidity();
-
-    if (!isnan(temperature) && !isnan(humidity)) {
-      Serial.printf("Temperature: %.2f°C, Humidity: %.2f%%\n", temperature, humidity);
-      tb.sendTelemetryData("temperature", temperature);
-      tb.sendTelemetryData("humidity", humidity);
-    } else {
-      Serial.println("Failed to read from DHT20 sensor!");
-    }
-    vTaskDelay(10000 / portTICK_PERIOD_MS);
+const bool reconnect() {
+  // Check to ensure we aren't connected yet
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    return true;
   }
+  // If we aren't establish a new connection to the given WiFi network
+  InitWiFi();
+  return true;
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_DEBUG_BAUD);
   pinMode(LED_PIN, OUTPUT);
+  delay(1000);
+  InitWiFi();
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Wire.begin(SDA_PIN, SCL_PIN);
   dht20.begin();
-
-  xTaskCreate(checkWiFiTask, "Check WiFi", 4096, NULL, 1, NULL);
-  xTaskCreate(checkCoreIoTTask, "Check CoreIoT", 4096, NULL, 1, NULL);
-  xTaskCreate(telemetryTask, "Telemetry", 4096, NULL, 1, NULL);
-  xTaskCreate(otaUpdateTask, "OTA Update", 8192, NULL, 1, NULL);
+  
 }
 
 void loop() {
-  delay(1000);
+  delay(10);
+
+  if (!reconnect()) {
+    return;
+  }
+
+  if (!tb.connected()) {
+    Serial.print("Connecting to: ");
+    Serial.print(THINGSBOARD_SERVER);
+    Serial.print(" with token ");
+    Serial.println(TOKEN);
+    if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
+      Serial.println("Failed to connect");
+      return;
+    }
+
+    tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
+
+    Serial.println("Subscribing for RPC...");
+    if (!tb.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
+      Serial.println("Failed to subscribe for RPC");
+      return;
+    }
+
+    if (!tb.Shared_Attributes_Subscribe(attributes_callback)) {
+      Serial.println("Failed to subscribe for shared attribute updates");
+      return;
+    }
+
+    Serial.println("Subscribe done");
+
+    if (!tb.Shared_Attributes_Request(attribute_shared_request_callback)) {
+      Serial.println("Failed to request for shared attributes");
+      return;
+    }
+  }
+
+  if (attributesChanged) {
+    attributesChanged = false;
+    tb.sendAttributeData(LED_STATE_ATTR, digitalRead(LED_PIN));
+  }
+
+  // if (ledMode == 1 && millis() - previousStateChange > blinkingInterval) {
+  //   previousStateChange = millis();
+  //   digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  //   Serial.print("LED state changed to: ");
+  //   Serial.println(!digitalRead(LED_PIN));
+  // }
+
+  if (millis() - previousDataSend > telemetrySendInterval) {
+    previousDataSend = millis();
+
+    dht20.read();
+    
+    float temperature = dht20.getTemperature();
+    float humidity = dht20.getHumidity();
+
+    if (isnan(temperature) || isnan(humidity)) {
+      Serial.println("Failed to read from DHT20 sensor!");
+    } else {
+      Serial.print("Temperature: ");
+      Serial.print(temperature);
+      Serial.print(" °C, Humidity: ");
+      Serial.print(humidity);
+      Serial.println(" %");
+
+      tb.sendTelemetryData("temperature", temperature);
+      tb.sendTelemetryData("humidity", humidity);
+    }
+
+    tb.sendAttributeData("rssi", WiFi.RSSI());
+    tb.sendAttributeData("channel", WiFi.channel());
+    tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
+    tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
+    tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+  }
+
+  tb.loop();
 }
